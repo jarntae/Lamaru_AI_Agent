@@ -20,16 +20,18 @@ from lamaru.tools.git import (
     GitStatusTool,
 )
 from lamaru.tools.search import SearchFilesTool, SearchTextTool
+from lamaru.tools.security import ToolSecurityPolicy
 from lamaru.tools.terminal import RunCommandTool
 
 logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
-    """Registry managing available tools and executing them with timeout protection."""
+    """Registry managing available tools and executing them with security and timeout protection."""
 
-    def __init__(self) -> None:
+    def __init__(self, security_policy: Optional[ToolSecurityPolicy] = None) -> None:
         self._tools: Dict[str, Tool] = {}
+        self.security_policy = security_policy
 
     def register(self, tool: Tool) -> None:
         """Register a new tool instance."""
@@ -55,8 +57,13 @@ class ToolRegistry:
         """Return definitions of all registered tools."""
         return [tool.definition for tool in self._tools.values()]
 
-    async def execute(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> ToolResult:
-        """Execute a tool by name with timeout protection."""
+    async def execute(
+        self,
+        name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        is_user_confirmed: bool = False,
+    ) -> ToolResult:
+        """Execute a tool by name with security authorization and timeout protection."""
         tool = self.get(name)
         if not tool:
             return ToolResult(
@@ -66,6 +73,19 @@ class ToolRegistry:
             )
 
         args = arguments or {}
+
+        # Tool security policy check
+        if self.security_policy:
+            authorized, reason = self.security_policy.authorize_execution(
+                tool.definition, args, is_user_confirmed=is_user_confirmed
+            )
+            if not authorized:
+                return ToolResult(
+                    success=False,
+                    error=reason,
+                    metadata={"tool_name": name, "blocked_by_security": True},
+                )
+
         timeout = tool.definition.timeout_seconds
 
         try:
@@ -86,9 +106,16 @@ class ToolRegistry:
             )
 
 
-def create_default_tool_registry(workspace_root: Optional[str] = None) -> ToolRegistry:
+def create_default_tool_registry(
+    workspace_root: Optional[str] = None,
+    security_policy: Optional[ToolSecurityPolicy] = None,
+) -> ToolRegistry:
     """Create and return a ToolRegistry populated with all standard native tools."""
-    registry = ToolRegistry()
+    policy = security_policy
+    if policy is None and workspace_root is not None:
+        policy = ToolSecurityPolicy(workspace_root=workspace_root)
+
+    registry = ToolRegistry(security_policy=policy)
     tools: List[Tool] = [
         # Filesystem
         ReadFileTool(workspace_root=workspace_root),

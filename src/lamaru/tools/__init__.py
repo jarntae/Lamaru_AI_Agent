@@ -17,10 +17,17 @@ from lamaru.tools.git import (
 )
 from lamaru.tools.registry import ToolRegistry, create_default_tool_registry
 from lamaru.tools.search import SearchFilesTool, SearchTextTool
+from lamaru.tools.security import (
+    CommandGuard,
+    SecurityViolationError,
+    ToolSecurityPolicy,
+    WorkspaceGuard,
+)
 from lamaru.tools.terminal import RunCommandTool
 
 __all__ = [
     "BaseGitTool",
+    "CommandGuard",
     "DeleteFileTool",
     "EditFileTool",
     "GitBranchTool",
@@ -33,7 +40,10 @@ __all__ = [
     "RunCommandTool",
     "SearchFilesTool",
     "SearchTextTool",
+    "SecurityViolationError",
     "ToolRegistry",
+    "ToolSecurityPolicy",
+    "WorkspaceGuard",
     "WriteFileTool",
     "create_default_tool_registry",
 ]
