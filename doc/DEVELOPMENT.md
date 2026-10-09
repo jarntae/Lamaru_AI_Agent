@@ -113,19 +113,33 @@ Examples:
 - provider interface -> `PROVIDERS.md`
 - database schema -> `DATABASE.md`
 
-## 10. Git discipline
+## 10. Git discipline & PR Workflow
 
-Keep changes focused.
+Always develop features in dedicated branches — never commit directly to `main`.
 
-Prefer small commits such as:
-
-```text
-feat: add provider interface
-feat: add google provider
-feat: add model registry
-feat: add router scoring
-test: add fallback tests
-```
+### Workflow per Phase / Feature:
+1. **Branch creation:** Create a dedicated branch from up-to-date `main`:
+   ```bash
+   git checkout main
+   git pull origin main
+   git checkout -b feat/phase-X-<feature-name>
+   ```
+2. **Focused commits:** Keep changes focused with conventional commits:
+   ```text
+   feat: add provider interface
+   feat: add google provider
+   feat: add model registry
+   test: add fallback tests
+   ```
+3. **Verify tests:** All unit tests must pass before pushing:
+   ```bash
+   .\.venv\Scripts\pytest.exe -v
+   ```
+4. **Push branch for GitHub review:**
+   ```bash
+   git push origin feat/phase-X-<feature-name>
+   ```
+5. **PR & Merge:** The project owner reviews the code diff on GitHub and merges into `main`.
 
 ## 11. AI agent restrictions
 

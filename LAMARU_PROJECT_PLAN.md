@@ -30,6 +30,7 @@
 7. ห้ามรัน destructive commands โดยอัตโนมัติ
 8. อย่าแก้หลาย subsystem พร้อมกันโดยไม่มีเหตุผล
 9. ทุก Phase ต้องผ่าน tests ก่อนขึ้น Phase ถัดไป
+10. ทุก Phase ต้องพัฒนาใน Branch แยก (เช่น `feat/phase-X-<name>`) เสมอ ห้าม commit/push ตรงเข้า `main` เมื่อเสร็จและผ่าน tests 100% ให้ push branch ขึ้น GitHub เพื่อเปิด PR ให้เจ้าของโปรเจกต์รีวิวโค้ดก่อน merge
 
 ## 2. Technology
 
@@ -72,6 +73,31 @@ lamaru-ai/
 ├── README.md
 └── pyproject.toml
 ```
+
+## 4. Git Branching & PR Workflow
+
+เพื่อความสะดวกในการรีวิว Code Diff ผ่าน GitHub Web ก่อนรวมโค้ด:
+
+1. **สร้าง Branch ประจำ Phase จาก main ล่าสุด:**
+   ```bash
+   git checkout main
+   git pull origin main
+   git checkout -b feat/phase-X-<feature-name>
+   ```
+2. **พัฒนาโค้ดและเขียน Unit Tests ภายใน Branch นั้น**
+3. **ตรวจสอบว่า Tests ทั้งหมดผ่าน 100%:**
+   ```bash
+   .\.venv\Scripts\pytest.exe -v
+   ```
+4. **Commit และ Push ขึ้น GitHub:**
+   ```bash
+   git add .
+   git commit -m "feat: implement <description> for phase X"
+   git push origin feat/phase-X-<feature-name>
+   ```
+5. **รีวิวและ Merge:**
+   - เจ้าของโปรเจกต์รีวิว Pull Request / Diff บน GitHub Web
+   - เมื่ออนุมัติแล้ว Merge เข้า `main`
 
 ---
 
