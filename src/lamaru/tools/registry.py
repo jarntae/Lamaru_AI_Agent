@@ -20,7 +20,7 @@ from lamaru.tools.git import (
     GitStatusTool,
 )
 from lamaru.tools.search import SearchFilesTool, SearchTextTool
-from lamaru.tools.security import ToolSecurityPolicy
+from lamaru.tools.security import SecretSanitizer, ToolSecurityPolicy
 from lamaru.tools.terminal import RunCommandTool
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,10 @@ class ToolRegistry:
 
         try:
             result = await asyncio.wait_for(tool.execute(args), timeout=timeout)
+            # Automatic Secret Redaction on outputs and errors
+            result.output = SecretSanitizer.sanitize_data(result.output)
+            if result.error:
+                result.error = SecretSanitizer.sanitize_text(result.error)
             return result
         except asyncio.TimeoutError:
             return ToolResult(

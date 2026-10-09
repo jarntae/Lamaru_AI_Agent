@@ -1,4 +1,4 @@
-"""Security enforcement: permissions, workspace boundary containment, and command blacklists."""
+"""Security enforcement: permissions, workspace boundary containment, protected files, and command blacklists."""
 
 import os
 from pathlib import Path
@@ -13,16 +13,49 @@ class SecurityViolationError(Exception):
     pass
 
 
+DEFAULT_PROTECTED_FILE_PATTERNS = [
+    r"^\.env(\..+)?$",                 # .env, .env.local, .env.development, .env.production
+    r".*\.key$",                       # Private keys
+    r".*\.pem$",                       # Certificates / PEM
+    r".*\.pfx$",                       # PKCS#12 keys
+    r"^id_rsa.*$",                     # SSH keys
+    r".*\.db$",                        # SQLite databases
+    r".*\.sqlite3?$",                  # SQLite databases
+    r"^.*\.git[\\/]config$",           # Git repository config (may contain tokens)
+]
+
+
 class WorkspaceGuard:
-    """Enforces that file paths remain strictly inside the authorized workspace boundary."""
+    """Enforces that file paths remain strictly inside the authorized workspace boundary and protects sensitive files."""
 
-    def __init__(self, workspace_root: str) -> None:
+    def __init__(
+        self,
+        workspace_root: str,
+        protected_patterns: Optional[List[str]] = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self.protected_patterns = (
+            protected_patterns if protected_patterns is not None else list(DEFAULT_PROTECTED_FILE_PATTERNS)
+        )
 
-    def validate_path(self, target_path: str) -> Path:
-        """Validate that target_path resolves strictly within workspace_root.
+    def is_protected_file(self, target_path: Path) -> bool:
+        """Check if target file matches sensitive protected file patterns."""
+        filename = target_path.name
+        try:
+            rel_str = str(target_path.relative_to(self.workspace_root)).replace("\\", "/")
+        except ValueError:
+            rel_str = filename
 
-        Raises SecurityViolationError if the path attempts traversal or lies outside.
+        for pattern in self.protected_patterns:
+            if re.search(pattern, filename, re.IGNORECASE) or re.search(pattern, rel_str, re.IGNORECASE):
+                return True
+        return False
+
+    def validate_path(self, target_path: str, allow_protected: bool = False) -> Path:
+        """Validate that target_path resolves strictly within workspace_root and is not a protected file.
+
+        Raises SecurityViolationError if the path attempts traversal, lies outside,
+        or targets a protected file (e.g. .env, *.key).
         """
         p = Path(target_path)
         if not p.is_absolute():
@@ -31,11 +64,15 @@ class WorkspaceGuard:
             resolved = p.resolve()
 
         try:
-            # Check relative_to
             resolved.relative_to(self.workspace_root)
         except ValueError:
             raise SecurityViolationError(
                 f"Path traversal detected or path outside workspace boundary: {target_path} -> {resolved}"
+            )
+
+        if not allow_protected and self.is_protected_file(resolved):
+            raise SecurityViolationError(
+                f"Access to sensitive protected file is BLOCKED: {target_path}"
             )
 
         return resolved
@@ -69,6 +106,38 @@ class CommandGuard:
         return None
 
 
+class SecretSanitizer:
+    """Redacts known API keys and sensitive tokens from text and structured payloads."""
+
+    SECRET_PATTERNS = [
+        (r"AIza[0-9A-Za-z\-_]{30,40}", "[REDACTED_GOOGLE_API_KEY]"),
+        (r"sk-[a-zA-Z0-9]{40,60}", "[REDACTED_OPENAI_API_KEY]"),
+        (r"sk-proj-[a-zA-Z0-9_\-]{40,}", "[REDACTED_OPENAI_API_KEY]"),
+        (r"sk-ant-[a-zA-Z0-9_\-]{35,}", "[REDACTED_ANTHROPIC_API_KEY]"),
+    ]
+
+    @classmethod
+    def sanitize_text(cls, text: Optional[str]) -> Optional[str]:
+        """Replace occurrences of secret patterns with redaction placeholder."""
+        if not text:
+            return text
+        sanitized = text
+        for pattern, replacement in cls.SECRET_PATTERNS:
+            sanitized = re.sub(pattern, replacement, sanitized)
+        return sanitized
+
+    @classmethod
+    def sanitize_data(cls, data: Any) -> Any:
+        """Recursively sanitize strings inside dictionaries, lists, or primitive types."""
+        if isinstance(data, str):
+            return cls.sanitize_text(data)
+        elif isinstance(data, dict):
+            return {k: cls.sanitize_data(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [cls.sanitize_data(item) for item in data]
+        return data
+
+
 class ToolSecurityPolicy:
     """Configurable security policy for agent tools."""
 
@@ -77,9 +146,14 @@ class ToolSecurityPolicy:
         workspace_root: Optional[str] = None,
         tool_permissions: Optional[Dict[str, PermissionLevel]] = None,
         allow_destructive_commands: bool = False,
+        protected_file_patterns: Optional[List[str]] = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
-        self.workspace_guard = WorkspaceGuard(str(self.workspace_root)) if self.workspace_root else None
+        self.workspace_guard = (
+            WorkspaceGuard(str(self.workspace_root), protected_patterns=protected_file_patterns)
+            if self.workspace_root
+            else None
+        )
         self.command_guard = CommandGuard()
         self.allow_destructive_commands = allow_destructive_commands
 
@@ -129,7 +203,7 @@ class ToolSecurityPolicy:
         if permission == PermissionLevel.CONFIRMATION_REQUIRED and not is_user_confirmed:
             return False, f"Tool '{tool_definition.name}' requires user confirmation before execution."
 
-        # 2. Filesystem boundary check
+        # 2. Filesystem boundary and protected files check
         if self.workspace_guard and "path" in arguments and isinstance(arguments["path"], str):
             try:
                 self.workspace_guard.validate_path(arguments["path"])
@@ -144,4 +218,3 @@ class ToolSecurityPolicy:
                 return False, f"Execution BLOCKED: {blocked_reason}"
 
         return True, None
-

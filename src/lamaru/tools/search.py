@@ -1,12 +1,24 @@
-"""Search tools: search_files (glob) and search_text (grep)."""
+"""Search tools: search_files (glob) and search_text (grep) with sensitive file exclusion."""
 
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 
 from lamaru.domain.tools import PermissionLevel, Tool, ToolDefinition, ToolResult
+from lamaru.tools.security import DEFAULT_PROTECTED_FILE_PATTERNS
 
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "node_modules", ".idea", ".vscode"}
+
+
+def is_sensitive_file(filename: str, rel_path: Optional[str] = None) -> bool:
+    """Check if file matches sensitive protected file patterns."""
+    for pattern in DEFAULT_PROTECTED_FILE_PATTERNS:
+        if re.search(pattern, filename, re.IGNORECASE):
+            return True
+        if rel_path and re.search(pattern, rel_path, re.IGNORECASE):
+            return True
+    return False
 
 
 class SearchFilesTool(Tool):
@@ -19,7 +31,7 @@ class SearchFilesTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="search_files",
-            description="Search for files matching a glob pattern (e.g. '*.py', '**/*.json').",
+            description="Search for files matching a glob pattern (e.g. '*.py', '**/*.json'). Excludes sensitive files.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -58,11 +70,19 @@ class SearchFilesTool(Tool):
                 parts = set(item.parts)
                 if parts.intersection(EXCLUDED_DIRS):
                     continue
+
                 try:
                     rel_p = item.relative_to(target_path)
-                    matches.append(str(rel_p))
+                    rel_str = str(rel_p).replace("\\", "/")
                 except ValueError:
-                    matches.append(str(item))
+                    rel_p = item
+                    rel_str = str(item).replace("\\", "/")
+
+                # Filter out sensitive protected files (.env, *.key, *.pem, *.db, etc.)
+                if is_sensitive_file(item.name, rel_str):
+                    continue
+
+                matches.append(str(rel_p))
 
                 if len(matches) >= max_results:
                     break
@@ -86,7 +106,7 @@ class SearchTextTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="search_text",
-            description="Search for text across files in a directory (like grep).",
+            description="Search for text across files in a directory (like grep). Excludes sensitive files.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -129,8 +149,20 @@ class SearchTextTool(Tool):
                 dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
                 for filename in files:
                     file_path = Path(root) / filename
+
+                    try:
+                        rel_p = str(file_path.relative_to(target_path)).replace("\\", "/")
+                    except ValueError:
+                        rel_p = filename
+
+                    # Exclude sensitive files (.env, *.key, *.pem, *.db, etc.)
+                    if is_sensitive_file(filename, rel_p):
+                        continue
+
                     # Skip common binary/huge files
-                    if file_path.suffix.lower() in {".pyc", ".png", ".jpg", ".jpeg", ".zip", ".tar", ".gz", ".exe", ".bin"}:
+                    if file_path.suffix.lower() in {
+                        ".pyc", ".png", ".jpg", ".jpeg", ".zip", ".tar", ".gz", ".exe", ".bin"
+                    }:
                         continue
 
                     try:
@@ -138,7 +170,6 @@ class SearchTextTool(Tool):
                             for line_idx, line in enumerate(f, start=1):
                                 line_to_check = line if case_sensitive else line.lower()
                                 if search_query in line_to_check:
-                                    rel_p = str(file_path.relative_to(target_path))
                                     results.append(
                                         {
                                             "file": rel_p,

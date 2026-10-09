@@ -19,6 +19,7 @@ from lamaru.tools.registry import ToolRegistry, create_default_tool_registry
 from lamaru.tools.search import SearchFilesTool, SearchTextTool
 from lamaru.tools.security import (
     CommandGuard,
+    SecretSanitizer,
     SecurityViolationError,
     ToolSecurityPolicy,
     WorkspaceGuard,
@@ -40,6 +41,7 @@ __all__ = [
     "RunCommandTool",
     "SearchFilesTool",
     "SearchTextTool",
+    "SecretSanitizer",
     "SecurityViolationError",
     "ToolRegistry",
     "ToolSecurityPolicy",
