@@ -14,14 +14,19 @@ class SecurityViolationError(Exception):
 
 
 DEFAULT_PROTECTED_FILE_PATTERNS = [
-    r"^\.env(\..+)?$",                 # .env, .env.local, .env.development, .env.production
-    r".*\.key$",                       # Private keys
-    r".*\.pem$",                       # Certificates / PEM
-    r".*\.pfx$",                       # PKCS#12 keys
-    r"^id_rsa.*$",                     # SSH keys
-    r".*\.db$",                        # SQLite databases
-    r".*\.sqlite3?$",                  # SQLite databases
-    r"^.*\.git[\\/]config$",           # Git repository config (may contain tokens)
+    # Environment variables & secrets
+    r"^\.env(\..+)?$",                         # .env, .env.local, .env.prod
+    r".*\.(key|pem|pfx|p12|crt|cer)$",          # Certificates & Private Keys
+    r"^id_(rsa|ed25519|ecdsa|dsa).*",          # SSH Private & Public Keys
+    r".*\.db$",                                # SQLite databases
+    r".*\.sqlite3?$",                          # SQLite databases
+    r"^.*\.git[\\/]config$",                   # Git repository credentials
+    # Cloud & Service Account credentials
+    r".*(service[-_]?account|client[-_]?secret|credentials).*\.json$",
+    # Package manager & tool authentication
+    r"^\.(netrc|npmrc|pypirc)$",
+    r"^.*\.aws[\\/]credentials$",
+    r"^.*\.docker[\\/]config\.json$",
 ]
 
 
@@ -78,8 +83,16 @@ class WorkspaceGuard:
         return resolved
 
 
+SENSITIVE_FILE_COMMAND_PATTERNS = [
+    # View/read/cat commands targeting sensitive files
+    r"\b(cat|type|more|less|head|tail|Get-Content|gc)\s+.*(\.env|\.key|\.pem|id_rsa|id_ed25519|id_ecdsa|id_dsa)",
+    # Dump environment variables
+    r"\b(printenv|Get-ChildItem\s+env:|dir\s+env:)",
+]
+
+
 class CommandGuard:
-    """Inspects shell commands to block catastrophic or destructive operations."""
+    """Inspects shell commands to block catastrophic or destructive operations and sensitive file access."""
 
     DESTRUCTIVE_PATTERNS = [
         r"\brm\s+-[rRfF]+\s+[/~]",              # rm -rf / or ~
@@ -92,14 +105,26 @@ class CommandGuard:
         r"\bdel\s+/[fFqQsS]+\s+[cC]:\\",        # del /f /s /q c:\
     ]
 
-    def __init__(self, blocked_patterns: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        blocked_patterns: Optional[List[str]] = None,
+        sensitive_cmd_patterns: Optional[List[str]] = None,
+    ) -> None:
         self.blocked_patterns = (blocked_patterns or []) + self.DESTRUCTIVE_PATTERNS
+        self.sensitive_cmd_patterns = (
+            sensitive_cmd_patterns
+            if sensitive_cmd_patterns is not None
+            else list(SENSITIVE_FILE_COMMAND_PATTERNS)
+        )
 
     def check_command(self, command: str) -> Optional[str]:
-        """Check if command matches blocked destructive patterns.
+        """Check if command matches blocked destructive or sensitive patterns.
 
         Returns matching reason if blocked, None if clean.
         """
+        for pat in self.sensitive_cmd_patterns:
+            if re.search(pat, command, re.IGNORECASE):
+                return f"Command attempts to access sensitive files or environment: '{pat}'"
         for pat in self.blocked_patterns:
             if re.search(pat, command, re.IGNORECASE):
                 return f"Command matches dangerous pattern: '{pat}'"
@@ -111,17 +136,32 @@ class SecretSanitizer:
 
     SECRET_PATTERNS = [
         (r"AIza[0-9A-Za-z\-_]{30,40}", "[REDACTED_GOOGLE_API_KEY]"),
-        (r"sk-[a-zA-Z0-9]{40,60}", "[REDACTED_OPENAI_API_KEY]"),
-        (r"sk-proj-[a-zA-Z0-9_\-]{40,}", "[REDACTED_OPENAI_API_KEY]"),
-        (r"sk-ant-[a-zA-Z0-9_\-]{35,}", "[REDACTED_ANTHROPIC_API_KEY]"),
+        (r"sk-[a-zA-Z0-9]{30,60}", "[REDACTED_OPENAI_API_KEY]"),
+        (r"sk-proj-[a-zA-Z0-9_\-]{20,}", "[REDACTED_OPENAI_API_KEY]"),
+        (r"sk-ant-[a-zA-Z0-9_\-]{20,}", "[REDACTED_ANTHROPIC_API_KEY]"),
     ]
+
+    _registered_secrets: Set[str] = set()
+
+    @classmethod
+    def register_secret(cls, secret: str) -> None:
+        """Register an active secret value to be dynamically redacted."""
+        if secret and len(secret) >= 6:
+            cls._registered_secrets.add(secret)
+
+    @classmethod
+    def clear_registered_secrets(cls) -> None:
+        """Clear dynamically registered secrets (useful in tests)."""
+        cls._registered_secrets.clear()
 
     @classmethod
     def sanitize_text(cls, text: Optional[str]) -> Optional[str]:
-        """Replace occurrences of secret patterns with redaction placeholder."""
+        """Replace occurrences of secret patterns and registered secrets with redaction placeholder."""
         if not text:
             return text
         sanitized = text
+        for sec in sorted(cls._registered_secrets, key=len, reverse=True):
+            sanitized = sanitized.replace(sec, "[REDACTED_SECRET]")
         for pattern, replacement in cls.SECRET_PATTERNS:
             sanitized = re.sub(pattern, replacement, sanitized)
         return sanitized

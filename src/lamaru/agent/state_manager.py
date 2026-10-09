@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set
 import uuid
 
 from lamaru.domain.agent import AgentState, AgentStatus, Plan
+from lamaru.tools.security import SecretSanitizer
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +89,10 @@ class AgentStateManager:
 
         file_path = self._get_file_path(state.session_id)
         if file_path:
+            raw_json = state.to_json()
+            safe_json = SecretSanitizer.sanitize_text(raw_json) or raw_json
             with open(file_path, "w", encoding="utf-8") as f:
-                f.write(state.to_json())
+                f.write(safe_json)
 
     def get_session(self, session_id: str) -> Optional[AgentState]:
         """Retrieve session from memory or load from disk persistence."""

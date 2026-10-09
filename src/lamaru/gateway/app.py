@@ -1,12 +1,15 @@
 """FastAPI application factory for Lamaru Local AI Gateway."""
 
 import json
+import os
 import time
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, List, Optional
 import uuid
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from lamaru.domain.errors import ErrorCategory, LamaruError
@@ -27,6 +30,7 @@ from lamaru.models.registry import ModelRegistry
 from lamaru.providers.registry import ProviderRegistry
 from lamaru.router.fallback import FallbackEngine
 from lamaru.router.router import ModelRouter
+from lamaru.tools.security import SecretSanitizer
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -40,18 +44,55 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
+security_bearer = HTTPBearer(auto_error=False)
+
+
+async def verify_gateway_token(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security_bearer),
+) -> None:
+    """Validate gateway auth token if LAMARU_GATEWAY_TOKEN is configured in environment.
+
+    The /health endpoint is exempt to allow local health probing.
+    """
+    if request.url.path == "/health":
+        return
+
+    expected_token = os.environ.get("LAMARU_GATEWAY_TOKEN")
+    if not expected_token:
+        return  # Local request allowed if no token is configured (default dev mode)
+
+    if not credentials or credentials.credentials != expected_token:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Gateway Token")
+
+
 def create_app(
     fallback_engine: Optional[FallbackEngine] = None,
     model_registry: Optional[ModelRegistry] = None,
     provider_registry: Optional[ProviderRegistry] = None,
+    allowed_hosts: Optional[List[str]] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application for Lamaru AI Gateway."""
+    # Register gateway token dynamically in SecretSanitizer if configured
+    if expected_token := os.environ.get("LAMARU_GATEWAY_TOKEN"):
+        SecretSanitizer.register_secret(expected_token)
+
     app = FastAPI(
         title="Lamaru AI Gateway",
         description="Local AI Gateway and Agent Runtime",
         version="0.1.0",
+        dependencies=[Depends(verify_gateway_token)],
     )
 
+    hosts = (
+        allowed_hosts
+        if allowed_hosts is not None
+        else ["127.0.0.1", "localhost", "testserver", "test"]
+    )
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=hosts,
+    )
     app.add_middleware(RequestIDMiddleware)
 
     # Dependencies

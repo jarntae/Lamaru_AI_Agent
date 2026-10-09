@@ -1,10 +1,30 @@
 """Terminal execution tool: run_command."""
 
 import asyncio
+import os
 from pathlib import Path
+import re
 from typing import Any, Dict, Optional
 
 from lamaru.domain.tools import PermissionLevel, Tool, ToolDefinition, ToolResult
+
+SENSITIVE_ENV_PATTERNS = [
+    r".*API_KEY.*",
+    r".*SECRET.*",
+    r".*TOKEN.*",
+    r".*PASSWORD.*",
+    r".*CREDENTIAL.*",
+]
+
+
+def get_sanitized_env() -> Dict[str, str]:
+    """Return a clean copy of environment variables stripped of API keys and secrets."""
+    clean_env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if any(re.search(pat, k, re.IGNORECASE) for pat in SENSITIVE_ENV_PATTERNS):
+            continue
+        clean_env[k] = v
+    return clean_env
 
 
 class RunCommandTool(Tool):
@@ -58,6 +78,7 @@ class RunCommandTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=get_sanitized_env(),
             )
 
             try:

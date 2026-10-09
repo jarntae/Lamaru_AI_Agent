@@ -146,3 +146,61 @@ def test_gateway_agent_stream():
             assert "event: completed" in body
 
     asyncio.run(_test())
+
+
+def test_gateway_trusted_host_middleware():
+    """Item 6: TrustedHostMiddleware must block requests from untrusted hosts (DNS rebinding defense)."""
+    async def _test():
+        app = build_test_app()
+        transport = httpx.ASGITransport(app=app)
+
+        # 1. Untrusted host header (e.g. DNS rebinding attack) -> 400 Invalid host header
+        async with httpx.AsyncClient(transport=transport, base_url="http://evil.attacker.com") as client:
+            res = await client.get("/health")
+            assert res.status_code == 400
+            assert "Invalid host header" in res.text
+
+        # 2. Trusted localhost -> 200 OK
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+            res = await client.get("/health")
+            assert res.status_code == 200
+            assert res.json()["status"] == "ok"
+
+    asyncio.run(_test())
+
+
+def test_gateway_token_authentication(monkeypatch):
+    """Item 6: Verify gateway auth token enforcement when configured."""
+    async def _test():
+        monkeypatch.setenv("LAMARU_GATEWAY_TOKEN", "secure-gateway-token-12345")
+        app = build_test_app()
+        transport = httpx.ASGITransport(app=app)
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+            # 1. /health is exempt and accessible without token
+            res_health = await client.get("/health")
+            assert res_health.status_code == 200
+
+            # 2. Protected endpoint without token -> 401 Unauthorized
+            res_unauth = await client.get("/v1/models")
+            assert res_unauth.status_code == 401
+            assert "Invalid Gateway Token" in res_unauth.text
+
+            # 3. Protected endpoint with incorrect token -> 401 Unauthorized
+            res_wrong = await client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer wrong-token-xyz"},
+            )
+            assert res_wrong.status_code == 401
+            assert "Invalid Gateway Token" in res_wrong.text
+
+            # 4. Protected endpoint with valid token -> 200 OK
+            res_ok = await client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer secure-gateway-token-12345"},
+            )
+            assert res_ok.status_code == 200
+            assert res_ok.json()["object"] == "list"
+
+    asyncio.run(_test())
+

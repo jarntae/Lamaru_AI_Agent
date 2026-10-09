@@ -1,11 +1,14 @@
 """Tests for Phase 15 Tool Security: permissions, workspace containment, protected files, and command blacklists."""
 
 import asyncio
+import os
 from pathlib import Path
 import tempfile
 import pytest
 
 from lamaru.domain.tools import PermissionLevel
+from lamaru.keys.manager import APIKeyManager
+from lamaru.keys.models import APIKeyMetadata, SecretReference
 from lamaru.tools.registry import create_default_tool_registry
 from lamaru.tools.search import SearchFilesTool, SearchTextTool
 from lamaru.tools.security import (
@@ -248,3 +251,168 @@ def test_model_cannot_override_policy():
     # Even if model attempts to claim ALLOWED on delete_file, the policy default is preserved
     assert policy.get_permission("delete_file") == PermissionLevel.CONFIRMATION_REQUIRED
     assert policy.get_permission("run_command") == PermissionLevel.CONFIRMATION_REQUIRED
+
+
+def test_subprocess_environment_isolation(monkeypatch):
+    """Item 1: Subprocess must not inherit sensitive environment variables like API keys and tokens."""
+    async def _test():
+        monkeypatch.setenv("GEMINI_API_KEY_01", "AIzaSyLeakedKey12345678901234567890")
+        monkeypatch.setenv("OPENAI_SECRET_TOKEN", "sk-proj-super-secret-token-test")
+        monkeypatch.setenv("DATABASE_PASSWORD", "SuperSecurePassword123")
+        monkeypatch.setenv("BENIGN_ENV_VAR", "SafeValue123")
+
+        policy = ToolSecurityPolicy(tool_permissions={"run_command": PermissionLevel.ALLOWED})
+        registry = create_default_tool_registry(security_policy=policy)
+
+        # Test sensitive env vars are stripped
+        code = (
+            "import os; "
+            "print('GEMINI:' + os.environ.get('GEMINI_API_KEY_01', 'NOT_FOUND')); "
+            "print('TOKEN:' + os.environ.get('OPENAI_SECRET_TOKEN', 'NOT_FOUND')); "
+            "print('PASSWORD:' + os.environ.get('DATABASE_PASSWORD', 'NOT_FOUND')); "
+            "print('BENIGN:' + os.environ.get('BENIGN_ENV_VAR', 'NOT_FOUND'))"
+        )
+        res = await registry.execute("run_command", {"command": f'python -c "{code}"'})
+        assert res.success is True
+        assert "GEMINI:NOT_FOUND" in res.output
+        assert "TOKEN:NOT_FOUND" in res.output
+        assert "PASSWORD:NOT_FOUND" in res.output
+        assert "BENIGN:SafeValue123" in res.output
+
+    asyncio.run(_test())
+
+
+def test_command_guard_blocks_sensitive_file_commands():
+    """Item 2: CommandGuard must block shell commands attempting to read sensitive files or dump env."""
+    guard = CommandGuard()
+
+    # Blocked sensitive file reading commands
+    blocked_commands = [
+        "cat .env",
+        "cat .env.local",
+        "type .env",
+        "Get-Content .env",
+        "gc .env",
+        "head -n 20 .env",
+        "tail .env",
+        "more private.key",
+        "less cert.pem",
+        "cat ~/.ssh/id_rsa",
+        "type id_ed25519",
+        "printenv",
+        "Get-ChildItem env:",
+        "dir env:",
+    ]
+
+    for cmd in blocked_commands:
+        reason = guard.check_command(cmd)
+        assert reason is not None, f"Expected '{cmd}' to be blocked"
+        assert "Command attempts to access sensitive files or environment" in reason
+
+    # Safe commands should pass
+    clean_commands = [
+        "python -m pytest",
+        "echo hello world",
+        "git status",
+        "cat src/lamaru/main.py",
+        "type README.md",
+    ]
+    for cmd in clean_commands:
+        assert guard.check_command(cmd) is None
+
+
+def test_expanded_protected_file_patterns():
+    """Item 3: Expanded DEFAULT_PROTECTED_FILE_PATTERNS must protect SSH keys, Cloud credentials, and config tokens."""
+    async def _test():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            # Create newly protected files
+            sensitive_files = [
+                "id_ed25519",
+                "id_ecdsa",
+                "gcp-service-account.json",
+                "client_secret.json",
+                "credentials.json",
+                ".npmrc",
+                ".netrc",
+                ".pypirc",
+            ]
+            for f in sensitive_files:
+                (tmp_path / f).write_text("SENSITIVE DATA", encoding="utf-8")
+
+            # Create nested credentials
+            aws_dir = tmp_path / ".aws"
+            aws_dir.mkdir(parents=True, exist_ok=True)
+            (aws_dir / "credentials").write_text("aws_secret_key = 12345", encoding="utf-8")
+
+            docker_dir = tmp_path / ".docker"
+            docker_dir.mkdir(parents=True, exist_ok=True)
+            (docker_dir / "config.json").write_text("docker_auth = 12345", encoding="utf-8")
+
+            # Benign file
+            (tmp_path / "normal_config.json").write_text('{"safe": true}', encoding="utf-8")
+
+            policy = ToolSecurityPolicy(workspace_root=tmpdir)
+            registry = create_default_tool_registry(workspace_root=tmpdir, security_policy=policy)
+
+            # 1. read_file must be BLOCKED on all sensitive files
+            for sf in sensitive_files:
+                res = await registry.execute("read_file", {"path": sf})
+                assert res.success is False
+                assert "sensitive protected file is BLOCKED" in res.error
+
+            res_aws = await registry.execute("read_file", {"path": ".aws/credentials"})
+            assert res_aws.success is False
+            assert "sensitive protected file is BLOCKED" in res_aws.error
+
+            res_docker = await registry.execute("read_file", {"path": ".docker/config.json"})
+            assert res_docker.success is False
+            assert "sensitive protected file is BLOCKED" in res_docker.error
+
+            # 2. Normal file is allowed
+            res_normal = await registry.execute("read_file", {"path": "normal_config.json"})
+            assert res_normal.success is True
+
+            # 3. SearchFilesTool must exclude all sensitive files
+            search_files = SearchFilesTool(workspace_root=tmpdir)
+            res_search = await search_files.execute({"pattern": "*"})
+            assert res_search.success is True
+            found = res_search.output
+            assert "normal_config.json" in found
+            for sf in sensitive_files:
+                assert sf not in found
+
+    asyncio.run(_test())
+
+
+def test_dynamic_secret_redaction_and_api_key_manager_integration():
+    """Item 4: Dynamic secrets registered via APIKeyManager or SecretSanitizer must be masked."""
+    # Clean state
+    SecretSanitizer.clear_registered_secrets()
+
+    # Direct registration
+    SecretSanitizer.register_secret("SuperSecretCustomTokenXYZ123")
+    sanitized = SecretSanitizer.sanitize_text("Authorization: SuperSecretCustomTokenXYZ123 applied.")
+    assert "SuperSecretCustomTokenXYZ123" not in sanitized
+    assert "[REDACTED_SECRET]" in sanitized
+
+    # Automatic registration through APIKeyManager
+    key_mgr = APIKeyManager()
+    custom_secret = "ProviderSpecificSecretKey987654321"
+    key_meta = APIKeyMetadata(
+        key_id="custom-key-01",
+        provider="custom",
+        secret_ref=SecretReference.from_raw(custom_secret),
+    )
+    key_mgr.register_key(key_meta)
+
+    # Verify key_mgr registration masked in SecretSanitizer
+    text_with_key = f"Key is {custom_secret} and must not be leaked."
+    sanitized_key = SecretSanitizer.sanitize_text(text_with_key)
+    assert custom_secret not in sanitized_key
+    assert "[REDACTED_SECRET]" in sanitized_key
+
+    # Clean up
+    SecretSanitizer.clear_registered_secrets()
+

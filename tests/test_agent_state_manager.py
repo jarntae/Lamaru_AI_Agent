@@ -95,3 +95,42 @@ def test_restart_and_resume_recovery(tmp_path: Path):
     # Verify session can continue lifecycle to completion after resume
     mgr2.transition_state("sess-res-1", AgentStatus.COMPLETED)
     assert mgr2.get_session("sess-res-1").status == AgentStatus.COMPLETED
+
+
+def test_session_disk_persistence_sanitization(tmp_path: Path):
+    """Item 5: Session state stored on disk must sanitize sensitive API keys and secrets."""
+    storage_dir = tmp_path / "sessions"
+    mgr = AgentStateManager(storage_dir=storage_dir)
+
+    raw_google_key = "AIzaSySensitiveStorageKey123456789012"
+    raw_openai_key = "sk-proj-supersecrettoken1234567890123456789012"
+
+    state = mgr.create_session(
+        task=f"Configure deployment with Google key {raw_google_key}",
+        session_id="sess-secure-01",
+    )
+    state.messages.append(
+        Message(role=MessageRole.USER, content=f"My OpenAI token is {raw_openai_key}")
+    )
+    mgr.save_session(state)
+
+    # 1. Directly inspect the persisted JSON file on disk
+    file_path = storage_dir / "sess-secure-01.json"
+    assert file_path.exists()
+    disk_content = file_path.read_text(encoding="utf-8")
+
+    # The raw keys must NEVER appear in plaintext on disk
+    assert raw_google_key not in disk_content
+    assert raw_openai_key not in disk_content
+
+    # Redaction placeholders must be present
+    assert "[REDACTED_GOOGLE_API_KEY]" in disk_content
+    assert "[REDACTED_OPENAI_API_KEY]" in disk_content
+
+    # 2. Loading from disk in a fresh manager instance must parse successfully
+    mgr2 = AgentStateManager(storage_dir=storage_dir)
+    loaded_state = mgr2.get_session("sess-secure-01")
+    assert loaded_state is not None
+    assert "[REDACTED_GOOGLE_API_KEY]" in loaded_state.task
+    assert "[REDACTED_OPENAI_API_KEY]" in loaded_state.messages[0].content
+

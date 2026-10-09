@@ -6,6 +6,7 @@ import os
 from typing import Dict, List, Optional
 
 from lamaru.keys.models import APIKeyMetadata, KeyStatus, SecretReference
+from lamaru.tools.security import SecretSanitizer
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,9 @@ class APIKeyManager:
         if key.key_id in self._keys and not overwrite:
             raise ValueError(f"API key '{key.key_id}' is already registered.")
         self._keys[key.key_id] = key
+        secret_val = key.resolve_secret()
+        if secret_val:
+            SecretSanitizer.register_secret(secret_val)
         logger.info(f"Registered API key: {key.key_id} (provider: {key.provider})")
 
     def unregister_key(self, key_id: str) -> Optional[APIKeyMetadata]:
