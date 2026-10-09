@@ -1,6 +1,6 @@
 """Lamaru AI Gateway and Agent Runtime."""
 
-from lamaru import domain, errors, keys, models, providers, resilience
+from lamaru import domain, errors, keys, models, providers, resilience, router
 
 __version__ = "0.1.0"
 
@@ -12,4 +12,5 @@ __all__ = [
     "models",
     "providers",
     "resilience",
+    "router",
 ]
