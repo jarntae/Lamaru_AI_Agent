@@ -182,10 +182,11 @@ class ModelRouter:
             provider_id = model.provider
 
             if self.key_manager:
-                available_keys = self.key_manager.get_available_keys(
-                    provider_id, now=current_time
-                )
-                if available_keys:
+                all_keys = self.key_manager.list_keys(provider=provider_id)
+                if all_keys:
+                    available_keys = self.key_manager.get_available_keys(
+                        provider_id, now=current_time
+                    )
                     for k in available_keys:
                         candidates.append(
                             CandidateTarget(
@@ -196,7 +197,7 @@ class ModelRouter:
                             )
                         )
                 else:
-                    # If provider does not require/have keys in manager (e.g. local)
+                    # Provider does not use keys in key_manager (e.g. local)
                     candidates.append(
                         CandidateTarget(
                             provider=provider_id,
