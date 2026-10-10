@@ -20,7 +20,7 @@ from lamaru.domain.messages import (
     Usage,
 )
 from lamaru.domain.models import Model, ModelCapability
-from lamaru.domain.tools import Tool, ToolDefinition, ToolResult
+from lamaru.domain.tools import PermissionLevel, Tool, ToolDefinition, ToolResult
 from lamaru.errors.classifier import ErrorClassifier
 from lamaru.keys.manager import APIKeyManager
 from lamaru.keys.models import APIKeyMetadata, SecretReference
@@ -31,6 +31,7 @@ from lamaru.resilience.cooldown import CooldownTracker
 from lamaru.router.fallback import FallbackEngine
 from lamaru.router.router import ModelRouter
 from lamaru.tools.registry import ToolRegistry
+from lamaru.tools.security import ToolSecurityPolicy
 
 
 class ProgrammableMockProvider(MockProvider):
@@ -107,7 +108,10 @@ class SlowTool(Tool):
         return ToolResult(success=True, output="Done")
 
 
-def setup_test_environment(provider: Optional[MockProvider] = None):
+def setup_test_environment(
+    provider: Optional[MockProvider] = None,
+    security_policy: Optional[ToolSecurityPolicy] = None,
+):
     """Setup standard test environment with ModelRegistry, ProviderRegistry, KeyManager, and FallbackEngine."""
     model_reg = ModelRegistry()
     provider_reg = ProviderRegistry()
@@ -155,7 +159,7 @@ def setup_test_environment(provider: Optional[MockProvider] = None):
     state_mgr = AgentStateManager()
     context_mgr = ContextManager()
 
-    tool_reg = ToolRegistry()
+    tool_reg = ToolRegistry(security_policy=security_policy)
     tool_reg.register(MockCalculatorTool())
 
     loop = AgentLoop(
@@ -592,3 +596,649 @@ def test_agent_loop_disk_persistence(tmp_path: Path):
         assert loaded.messages[-1].content == "2 * 3 = 6"
 
     asyncio.run(_test())
+
+
+def test_agent_loop_multistep_tool_execution():
+    """Verify multi-step tool calls across multiple iterations until task completion."""
+    async def _test():
+        turn_1_resp = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="First, I'll calculate 10 + 20.",
+            tool_calls=[
+                ToolCall(
+                    id="call_add",
+                    name="calculate",
+                    arguments={"operation": "add", "a": 10, "b": 20},
+                )
+            ],
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
+        turn_2_resp = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Now I'll multiply that result by 2.",
+            tool_calls=[
+                ToolCall(
+                    id="call_mul",
+                    name="calculate",
+                    arguments={"operation": "multiply", "a": 30, "b": 2},
+                )
+            ],
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
+        turn_3_resp = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="The final result is 60.",
+            tool_calls=[],
+            finish_reason=FinishReason.STOP,
+        )
+
+        prog_prov = ProgrammableMockProvider(
+            provider_id="mock-prog",
+            responses=[turn_1_resp, turn_2_resp, turn_3_resp],
+        )
+
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        result = await loop.create_and_run(task="Calculate (10 + 20) * 2")
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.iterations == 3
+        assert result.final_response == "The final result is 60."
+        assert result.tools_invoked == ["calculate", "calculate"]
+        assert result.tool_results_count == 2
+
+        state = state_mgr.get_session(result.session_id)
+        assert state is not None
+        assert state.status == AgentStatus.COMPLETED
+        # Expected messages: USER -> ASSISTANT (add) -> TOOL (30) -> ASSISTANT (mul) -> TOOL (60) -> ASSISTANT (final)
+        assert len(state.messages) == 6
+        assert state.messages[0].role == MessageRole.USER
+        assert state.messages[1].role == MessageRole.ASSISTANT
+        assert state.messages[1].tool_calls[0].name == "calculate"
+        assert state.messages[2].role == MessageRole.TOOL
+        assert state.messages[2].content == "30"
+        assert state.messages[3].role == MessageRole.ASSISTANT
+        assert state.messages[3].tool_calls[0].name == "calculate"
+        assert state.messages[4].role == MessageRole.TOOL
+        assert state.messages[4].content == "60"
+        assert state.messages[5].role == MessageRole.ASSISTANT
+        assert state.messages[5].content == "The final result is 60."
+        assert len(state.tool_results) == 2
+        assert state.tool_results[0].output == 30
+        assert state.tool_results[1].output == 60
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_tool_security_policy_enforcement():
+    """Verify tool security policy blocks unconfirmed sensitive tool without crashing the loop."""
+    async def _test():
+        class SensitiveDeleteTool(Tool):
+            @property
+            def definition(self) -> ToolDefinition:
+                return ToolDefinition(
+                    name="delete_file",
+                    description="Delete a file",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+                    permission=PermissionLevel.CONFIRMATION_REQUIRED,
+                )
+
+            async def execute(self, input_args: Dict[str, Any]) -> ToolResult:
+                return ToolResult(success=True, output="File deleted")
+
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Attempting to delete file...",
+            tool_calls=[ToolCall(id="call_del", name="delete_file", arguments={"path": "important.txt"})],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Deletion was blocked by policy, proceeding safely without deletion.",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        policy = ToolSecurityPolicy()  # default sets delete_file to CONFIRMATION_REQUIRED
+        loop, state_mgr, _, _, tool_reg, _ = setup_test_environment(
+            provider=prog_prov, security_policy=policy
+        )
+        tool_reg.register(SensitiveDeleteTool())
+
+        result = await loop.create_and_run("Delete important.txt")
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.iterations == 2
+        assert "proceeding safely without deletion" in (result.final_response or "")
+
+        state = state_mgr.get_session(result.session_id)
+        assert len(state.tool_results) == 1
+        assert state.tool_results[0].success is False
+        assert "requires user confirmation" in (state.tool_results[0].error or "")
+        tool_msg = state.messages[2]
+        assert tool_msg.role == MessageRole.TOOL
+        assert "Error: Tool 'delete_file' requires user confirmation" in tool_msg.content
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_tool_security_workspace_boundary(tmp_path: Path):
+    """Verify tool security policy blocks workspace path traversal or protected file access."""
+    async def _test():
+        workspace_dir = tmp_path / "sandbox"
+        workspace_dir.mkdir()
+
+        class FileInspectTool(Tool):
+            @property
+            def definition(self) -> ToolDefinition:
+                return ToolDefinition(
+                    name="read_file",
+                    description="Read file contents",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+                    permission=PermissionLevel.ALLOWED,
+                )
+
+            async def execute(self, input_args: Dict[str, Any]) -> ToolResult:
+                return ToolResult(success=True, output="contents")
+
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Reading sensitive .env file...",
+            tool_calls=[ToolCall(id="call_read", name="read_file", arguments={"path": ".env"})],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Access to protected file was denied, continuing safely.",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        policy = ToolSecurityPolicy(workspace_root=str(workspace_dir))
+        loop, state_mgr, _, _, tool_reg, _ = setup_test_environment(
+            provider=prog_prov, security_policy=policy
+        )
+        tool_reg.register(FileInspectTool())
+
+        result = await loop.create_and_run("Read secret .env")
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.iterations == 2
+        state = state_mgr.get_session(result.session_id)
+        assert len(state.tool_results) == 1
+        assert state.tool_results[0].success is False
+        assert "Access to sensitive protected file is BLOCKED" in (state.tool_results[0].error or "")
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_mid_execution_cancellation():
+    """Verify cooperative cancellation triggered mid-execution from an event hook."""
+    async def _test():
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Calling calculator...",
+            tool_calls=[ToolCall(id="c1", name="calculate", arguments={"operation": "add", "a": 1, "b": 1})],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Done",
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        def event_listener(ev: Dict[str, Any]):
+            # When tool execution starts, trigger cooperative cancellation
+            if ev.get("event") == "tool_start":
+                loop.cancel(ev["session_id"])
+
+        result = await loop.create_and_run("Calculate something then cancel", on_event=event_listener)
+
+        assert result.status == AgentStatus.CANCELLED
+        assert result.cancelled is True
+        state = state_mgr.get_session(result.session_id)
+        assert state.status == AgentStatus.CANCELLED
+        assert state.status.is_terminal is True
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_all_models_fail_handled():
+    """Verify non-recoverable model failure when all fallback candidates fail transitions to FAILED."""
+    async def _test():
+        provider = MockProvider(provider_id="failing-mock")
+        provider.set_simulated_error(
+            LamaruError(
+                message="Internal API server completely down",
+                category=ErrorCategory.TEMPORARY_SERVER_ERROR,
+            )
+        )
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=provider)
+
+        result = await loop.create_and_run("Execute task with down provider")
+
+        assert result.status == AgentStatus.FAILED
+        assert result.cancelled is False
+        assert "Model execution failed" in (result.error or "")
+        state = state_mgr.get_session(result.session_id)
+        assert state.status == AgentStatus.FAILED
+        assert any("Model execution failed" in err for err in state.errors)
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_session_resumption():
+    """Verify resuming a previously paused session in WAITING_USER or WAITING_TOOL continues cleanly to completion."""
+    async def _test():
+        turn_resume_resp = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Resumed session completed successfully!",
+            tool_calls=[],
+        )
+        prog_prov = ProgrammableMockProvider(
+            provider_id="mock-prog",
+            responses=[turn_resume_resp],
+        )
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        # 1. Manually create a session and advance to WAITING_USER
+        session = state_mgr.create_session("Interactive resumed task")
+        session = state_mgr.transition_state(session.session_id, AgentStatus.PLANNING)
+        session = state_mgr.transition_state(session.session_id, AgentStatus.RUNNING)
+        session = state_mgr.transition_state(session.session_id, AgentStatus.WAITING_USER)
+        session.messages.append(Message(role=MessageRole.USER, content="User provided input"))
+        state_mgr.save_session(session)
+
+        # 2. Call loop.run on existing session_id
+        result = await loop.run(session.session_id)
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.final_response == "Resumed session completed successfully!"
+
+        state = state_mgr.get_session(session.session_id)
+        assert state.status == AgentStatus.COMPLETED
+        assert state.messages[-1].content == "Resumed session completed successfully!"
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_session_resumption_from_disk(tmp_path: Path):
+    """Verify durable disk persistence allows resuming across different AgentLoop and AgentStateManager instances."""
+    async def _test():
+        storage_dir = tmp_path / "sessions_resume"
+
+        # Step 1: Run Turn 1 on Loop 1 with max_iterations=1 to pause
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Calculating 4 + 5",
+            tool_calls=[ToolCall(id="c_add", name="calculate", arguments={"operation": "add", "a": 4, "b": 5})],
+        )
+        prov1 = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1])
+        mgr1 = AgentStateManager(storage_dir=storage_dir)
+
+        model_reg = ModelRegistry()
+        prov_reg = ProviderRegistry()
+        prov_reg.register(prov1)
+        model = Model(
+            provider="mock-prog",
+            model_id="test-model-1",
+            display_name="Test Model 1",
+            context_window=32000,
+            capabilities={ModelCapability.CODING, ModelCapability.TOOL_CALLING},
+        )
+        model_reg.register(model)
+        prov1.add_model(model)
+        router1 = ModelRouter(model_registry=model_reg, provider_registry=prov_reg)
+        tool_reg1 = ToolRegistry()
+        tool_reg1.register(MockCalculatorTool())
+
+        loop1 = AgentLoop(
+            state_manager=mgr1,
+            context_manager=ContextManager(),
+            router=router1,
+            provider_registry=prov_reg,
+            tool_registry=tool_reg1,
+        )
+
+        cfg1 = AgentLoopConfig(max_iterations=1)
+        res1 = await loop1.create_and_run("Compute 4 + 5", config=cfg1)
+        # Hit max iterations = 1
+        assert res1.status == AgentStatus.FAILED
+        sess_id = res1.session_id
+
+        # Step 2: Now reset state status to WAITING_TOOL in new manager instance and resume with Loop 2
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="The sum is 9.",
+            tool_calls=[],
+        )
+        prov2 = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_2])
+        prov_reg2 = ProviderRegistry()
+        prov_reg2.register(prov2)
+        prov2.add_model(model)
+        router2 = ModelRouter(model_registry=model_reg, provider_registry=prov_reg2)
+        tool_reg2 = ToolRegistry()
+        tool_reg2.register(MockCalculatorTool())
+
+        mgr2 = AgentStateManager(storage_dir=storage_dir)
+        loaded_state = mgr2.get_session(sess_id)
+        assert loaded_state is not None
+        # Reset status from FAILED to WAITING_TOOL for resumption test
+        loaded_state.status = AgentStatus.WAITING_TOOL
+        mgr2.save_session(loaded_state)
+
+        loop2 = AgentLoop(
+            state_manager=mgr2,
+            context_manager=ContextManager(),
+            router=router2,
+            provider_registry=prov_reg2,
+            tool_registry=tool_reg2,
+        )
+
+        cfg2 = AgentLoopConfig(max_iterations=5)
+        res2 = await loop2.run(sess_id, config=cfg2)
+
+        assert res2.status == AgentStatus.COMPLETED
+        assert res2.final_response == "The sum is 9."
+
+        final_state = mgr2.get_session(sess_id)
+        assert final_state.status == AgentStatus.COMPLETED
+        assert final_state.messages[-1].content == "The sum is 9."
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_event_hooks_sync_and_async():
+    """Verify both sync and async on_event listeners receive lifecycle events, and listener exceptions are swallowed safely."""
+    async def _test():
+        loop, _, _, _, _, _ = setup_test_environment()
+
+        async_events = []
+        async def async_listener(ev: Dict[str, Any]):
+            await asyncio.sleep(0.001)
+            async_events.append(ev["event"])
+
+        result = await loop.create_and_run("Async event hook test", on_event=async_listener)
+        assert result.status == AgentStatus.COMPLETED
+        assert "planning" in async_events
+        assert "started" in async_events
+        assert "iteration_start" in async_events
+        assert "model_response" in async_events
+        assert "completed" in async_events
+
+        # Listener that raises an exception should not crash the loop
+        def faulty_listener(ev: Dict[str, Any]):
+            raise RuntimeError("Listener exploded!")
+
+        res_faulty = await loop.create_and_run("Faulty listener test", on_event=faulty_listener)
+        assert res_faulty.status == AgentStatus.COMPLETED
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_unregistered_tool_handling():
+    """Verify model requesting an unregistered tool receives tool error result without crashing loop."""
+    async def _test():
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Calling phantom tool...",
+            tool_calls=[ToolCall(id="c_phantom", name="nonexistent_tool", arguments={"foo": "bar"})],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Tool not found, responding directly.",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        result = await loop.create_and_run("Try unregistered tool")
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.iterations == 2
+        state = state_mgr.get_session(result.session_id)
+        assert len(state.tool_results) == 1
+        assert state.tool_results[0].success is False
+        assert "not registered" in state.tool_results[0].error.lower()
+        assert state.messages[2].role == MessageRole.TOOL
+        assert "not registered" in state.messages[2].content.lower()
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_tool_exception_handling():
+    """Verify tool raising an unhandled exception is caught and returned as ToolResult error."""
+    async def _test():
+        class ExplodingTool(Tool):
+            @property
+            def definition(self) -> ToolDefinition:
+                return ToolDefinition(name="explode", description="Exploding tool")
+
+            async def execute(self, input_args: Dict[str, Any]) -> ToolResult:
+                raise ZeroDivisionError("division by zero inside tool")
+
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Calling explode tool...",
+            tool_calls=[ToolCall(id="c_boom", name="explode", arguments={})],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Handled explosion gracefully.",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        loop, state_mgr, _, _, tool_reg, _ = setup_test_environment(provider=prog_prov)
+        tool_reg.register(ExplodingTool())
+
+        result = await loop.create_and_run("Run exploding tool")
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.iterations == 2
+        state = state_mgr.get_session(result.session_id)
+        assert len(state.tool_results) == 1
+        assert state.tool_results[0].success is False
+        assert "division by zero" in (state.tool_results[0].error or "")
+        assert state.messages[2].role == MessageRole.TOOL
+        assert "division by zero" in state.messages[2].content
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_relevant_files_tracking_and_loading(tmp_path: Path):
+    """Verify file paths referenced in tool calls are recorded in state.relevant_files and loaded into context."""
+    async def _test():
+        test_file = tmp_path / "sample.py"
+        test_file.write_text("print('hello world')", encoding="utf-8")
+
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Reading file sample.py",
+            tool_calls=[
+                ToolCall(
+                    id="c_calc",
+                    name="calculate",
+                    arguments={"operation": "add", "a": 1, "b": 1, "path": str(test_file)},
+                )
+            ],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Finished inspecting sample.py",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        result = await loop.create_and_run(f"Inspect file {test_file}")
+
+        assert result.status == AgentStatus.COMPLETED
+        state = state_mgr.get_session(result.session_id)
+        assert str(test_file) in state.relevant_files
+
+        # Verify _load_relevant_files loaded the file contents
+        loaded_map = loop._load_relevant_files(state.relevant_files)
+        assert str(test_file) in loaded_map
+        assert loaded_map[str(test_file)] == "print('hello world')"
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_validation_and_terminal_errors():
+    """Verify validation guards: non-existent session, terminal session run, and missing dependencies."""
+    async def _test():
+        loop, state_mgr, context_mgr, _, _, _ = setup_test_environment()
+
+        # 1. Non-existent session
+        with pytest.raises(KeyError, match="Session 'missing_id' not found"):
+            await loop.run("missing_id")
+
+        # 2. Terminal session run (CREATED -> RUNNING -> COMPLETED)
+        session = state_mgr.create_session("Terminal check")
+        state_mgr.transition_state(session.session_id, AgentStatus.RUNNING)
+        state_mgr.transition_state(session.session_id, AgentStatus.COMPLETED)
+        with pytest.raises(ValueError, match="Cannot run session .* in terminal state COMPLETED"):
+            await loop.run(session.session_id)
+
+        # 3. Missing dependencies in constructor
+        with pytest.raises(ValueError, match="AgentLoop requires either an existing FallbackEngine"):
+            AgentLoop(state_manager=state_mgr, context_manager=context_mgr)
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_config_options_and_overrides():
+    """Verify custom system_prompt, model_override, provider_override, and temperature pass into AIRequest."""
+    async def _test():
+        prog_prov = ProgrammableMockProvider(
+            provider_id="mock",
+            responses=[AIResponse(provider="mock", model="test-model-1", content="Custom config OK")],
+        )
+        loop, _, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        cfg = AgentLoopConfig(
+            system_prompt="You are a strict QA auditor.",
+            model_override="test-model-1",
+            provider_override="mock",
+            temperature=0.2,
+            max_tokens=100,
+        )
+        result = await loop.create_and_run("Test config overrides", config=cfg)
+        assert result.status == AgentStatus.COMPLETED
+        assert len(prog_prov.received_requests) == 1
+        req = prog_prov.received_requests[0]
+        assert "strict QA auditor" in (req.system_prompt or "")
+        assert req.temperature == 0.2
+        assert req.max_tokens == 100
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_blocks_protected_files_from_relevant_files(tmp_path: Path):
+    """Verify AgentLoop blocks protected files (.env, *.key) from entering relevant_files and context."""
+    async def _test():
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
+        env_file = workspace_dir / ".env"
+        env_file.write_text("API_SECRET=super_secret_token", encoding="utf-8")
+
+        # Turn 1: model attempts to read .env
+        turn_1 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Attempting to read .env",
+            tool_calls=[
+                ToolCall(
+                    id="call_read_env",
+                    name="calculate",
+                    arguments={"operation": "add", "a": 1, "b": 1, "path": str(env_file)},
+                )
+            ],
+        )
+        turn_2 = AIResponse(
+            provider="mock-prog",
+            model="test-model-1",
+            content="Task completed without leaking .env",
+            tool_calls=[],
+        )
+
+        prog_prov = ProgrammableMockProvider(provider_id="mock-prog", responses=[turn_1, turn_2])
+        loop, state_mgr, _, _, _, _ = setup_test_environment(provider=prog_prov)
+
+        result = await loop.create_and_run("Do not leak .env")
+        assert result.status == AgentStatus.COMPLETED
+
+        state = state_mgr.get_session(result.session_id)
+        # 1. Protected file .env MUST NOT be in relevant_files
+        assert str(env_file) not in state.relevant_files
+
+        # 2. Even if .env was artificially forced into file_paths, _load_relevant_files MUST block it
+        loaded = loop._load_relevant_files([str(env_file)])
+        assert str(env_file) not in loaded
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_workspace_boundary_on_relevant_files(tmp_path: Path):
+    """Verify AgentLoop enforces WorkspaceGuard boundary on _load_relevant_files."""
+    async def _test():
+        from lamaru.tools.security import ToolSecurityPolicy
+
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("outside confidential content", encoding="utf-8")
+
+        inside_file = workspace_dir / "inside.txt"
+        inside_file.write_text("inside content", encoding="utf-8")
+
+        policy = ToolSecurityPolicy(workspace_root=str(workspace_dir))
+        tool_reg = ToolRegistry(security_policy=policy)
+
+        loop, state_mgr, context_mgr, fallback_engine, _, _ = setup_test_environment()
+        loop.tool_registry = tool_reg
+
+        # Loading outside file should be blocked by WorkspaceGuard
+        loaded = loop._load_relevant_files([str(outside_file), str(inside_file)])
+        assert str(outside_file) not in loaded
+        assert str(inside_file) in loaded
+        assert loaded[str(inside_file)] == "inside content"
+
+    asyncio.run(_test())
+
+
+def test_agent_loop_secret_sanitization_in_relevant_files(tmp_path: Path):
+    """Verify that file contents loaded into context have secrets and API keys sanitized."""
+    async def _test():
+        leak_file = tmp_path / "code_with_key.py"
+        leak_file.write_text("AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q", encoding="utf-8")
+
+        loop, _, _, _, _, _ = setup_test_environment()
+        loaded = loop._load_relevant_files([str(leak_file)])
+
+        assert str(leak_file) in loaded
+        assert "[REDACTED_GOOGLE_API_KEY]" in loaded[str(leak_file)]
+        assert "AIzaSy" not in loaded[str(leak_file)]
+
+    asyncio.run(_test())
+
