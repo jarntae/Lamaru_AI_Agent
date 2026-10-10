@@ -1035,3 +1035,85 @@ def test_model_switched_event_async_listener_and_resilience():
 
     asyncio.run(_test())
 
+
+def test_model_switching_secret_sanitization_in_events_and_reasons():
+    """Verify that raw keys in exceptions are redacted from model_switched reason, fallback logs, and events."""
+    async def _test():
+        raw_key = "AIzaSySecretLeak12345678901234567890"
+        leak_error = RuntimeError(f"HTTP 429: Rate limit exceeded while authenticating with key {raw_key}")
+
+        prov_a = ProgrammableMockProvider(
+            provider_id="prov-a",
+            responses=[leak_error],
+        )
+        prov_b = ProgrammableMockProvider(
+            provider_id="prov-b",
+            responses=[AIResponse(provider="prov-b", model="model-b", content="Recovered cleanly")],
+        )
+
+        model_reg = ModelRegistry()
+        prov_reg = ProviderRegistry()
+        prov_reg.register(prov_a)
+        prov_reg.register(prov_b)
+
+        key_mgr = APIKeyManager()
+        model_a = Model(
+            provider="prov-a",
+            model_id="model-a",
+            display_name="Model A",
+            capabilities={ModelCapability.CODING},
+            context_window=32000,
+            priority=10,
+        )
+        model_b = Model(
+            provider="prov-b",
+            model_id="model-b",
+            display_name="Model B",
+            capabilities={ModelCapability.CODING},
+            context_window=32000,
+            priority=5,
+        )
+        model_reg.register(model_a)
+        model_reg.register(model_b)
+        prov_a.add_model(model_a)
+        prov_b.add_model(model_b)
+
+        key_mgr.register_key(APIKeyMetadata(key_id="ka", provider="prov-a", secret_ref=SecretReference.from_raw("ka")))
+        key_mgr.register_key(APIKeyMetadata(key_id="kb", provider="prov-b", secret_ref=SecretReference.from_raw("kb")))
+
+        router = ModelRouter(model_registry=model_reg, provider_registry=prov_reg, key_manager=key_mgr)
+        fallback = FallbackEngine(router=router, provider_registry=prov_reg, key_manager=key_mgr)
+
+        loop = AgentLoop(
+            state_manager=AgentStateManager(),
+            context_manager=ContextManager(),
+            fallback_engine=fallback,
+        )
+
+        events: List[Dict[str, Any]] = []
+
+        def listener(ev: Dict[str, Any]) -> None:
+            events.append(ev)
+
+        result = await loop.create_and_run("Test secret sanitization during switch", on_event=listener)
+
+        assert result.status == AgentStatus.COMPLETED
+        assert result.final_response == "Recovered cleanly"
+
+        # Check model_switched event
+        switched_events = [e for e in events if e.get("event") == "model_switched"]
+        assert len(switched_events) == 1
+        switch_ev = switched_events[0]
+        assert raw_key not in switch_ev["reason"]
+        assert "[REDACTED_GOOGLE_API_KEY]" in switch_ev["reason"]
+
+        # Check model_fallback event
+        fallback_events = [e for e in events if e.get("event") == "model_fallback"]
+        assert len(fallback_events) == 1
+        fb_ev = fallback_events[0]
+        assert raw_key not in fb_ev["error"]
+        assert "[REDACTED_GOOGLE_API_KEY]" in fb_ev["error"]
+
+    asyncio.run(_test())
+
+

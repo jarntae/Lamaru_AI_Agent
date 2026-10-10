@@ -14,6 +14,7 @@ from lamaru.providers.registry import ProviderRegistry
 from lamaru.resilience.cooldown import CooldownTracker
 from lamaru.router.models import CandidateTarget
 from lamaru.router.router import ModelRouter
+from lamaru.tools.security import SecretSanitizer
 
 logger = logging.getLogger(__name__)
 
@@ -123,11 +124,12 @@ class FallbackEngine:
 
             # Check if candidate model switched from active_model
             if active_model and active_model != cand.model_id:
-                reason = (
+                raw_reason = (
                     attempts_history[-1].error_message
                     if attempts_history and not attempts_history[-1].success
                     else "Candidate router selection"
                 )
+                reason = SecretSanitizer.sanitize_text(raw_reason) or raw_reason
                 if on_model_switch:
                     switch_res = on_model_switch(active_model, cand.model_id, reason)
                     if hasattr(switch_res, "__await__"):
@@ -192,12 +194,13 @@ class FallbackEngine:
 
             except Exception as exc:
                 classification = self.error_classifier.classify_exception(exc)
+                sanitized_error = SecretSanitizer.sanitize_text(str(exc))
 
                 # Record attempt failure
                 failed_attempt = FallbackAttempt(
                     candidate=cand,
                     success=False,
-                    error_message=str(exc),
+                    error_message=sanitized_error,
                     error_category=classification.category,
                     attempted_at=current_time,
                 )
