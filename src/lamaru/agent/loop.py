@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
@@ -19,6 +20,11 @@ from lamaru.providers.registry import ProviderRegistry
 from lamaru.router.fallback import FallbackAttempt, FallbackEngine, FallbackResult
 from lamaru.router.router import ModelRouter
 from lamaru.tools.registry import ToolRegistry
+from lamaru.tools.security import (
+    DEFAULT_PROTECTED_FILE_PATTERNS,
+    SecretSanitizer,
+    SecurityViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +204,46 @@ class AgentLoop:
             logger.warning("Error in event listener callback: %s", exc)
 
     def _load_relevant_files(self, file_paths: List[str]) -> Dict[str, str]:
-        """Load contents of relevant workspace files up to a safe buffer limit."""
+        """Load contents of relevant workspace files up to a safe buffer limit with boundary and protected file enforcement."""
         files_map: Dict[str, str] = {}
+        workspace_guard = (
+            self.tool_registry.security_policy.workspace_guard
+            if self.tool_registry and self.tool_registry.security_policy
+            else None
+        )
         for fp in file_paths:
             try:
                 p = Path(fp)
-                if p.exists() and p.is_file():
-                    files_map[fp] = p.read_text(encoding="utf-8", errors="replace")[:65536]
+                # 1. Enforce WorkspaceGuard boundary and protected file check if configured
+                if workspace_guard:
+                    try:
+                        resolved_path = workspace_guard.validate_path(fp)
+                    except SecurityViolationError as sve:
+                        logger.warning(
+                            "Blocked loading protected or out-of-bounds file '%s' into context: %s",
+                            fp,
+                            sve,
+                        )
+                        continue
+                else:
+                    # Fallback check against default protected file patterns
+                    if any(
+                        re.search(pat, p.name, re.IGNORECASE)
+                        for pat in DEFAULT_PROTECTED_FILE_PATTERNS
+                    ):
+                        logger.warning(
+                            "Blocked loading protected file '%s' into context", fp
+                        )
+                        continue
+                    resolved_path = p
+
+                if resolved_path.exists() and resolved_path.is_file():
+                    raw_text = resolved_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:65536]
+                    files_map[fp] = (
+                        SecretSanitizer.sanitize_text(raw_text) or raw_text
+                    )
             except Exception as exc:
                 logger.debug("Failed reading relevant file %s: %s", fp, exc)
         return files_map
@@ -469,15 +508,6 @@ class AgentLoop:
                     }
                     state.tool_history.append(tool_entry)
 
-                    # Track file paths in state.relevant_files if tool touches a file
-                    f_path = tc.arguments.get("path") or tc.arguments.get("file_path")
-                    if (
-                        f_path
-                        and isinstance(f_path, str)
-                        and f_path not in state.relevant_files
-                    ):
-                        state.relevant_files.append(f_path)
-
                     await self._emit_event(
                         on_event,
                         {
@@ -515,6 +545,35 @@ class AgentLoop:
                         )
 
                     state.tool_results.append(tool_result)
+
+                    # Track file paths in state.relevant_files ONLY if tool executed successfully and safely
+                    if tool_result.success:
+                        f_path = tc.arguments.get("path") or tc.arguments.get("file_path")
+                        if (
+                            f_path
+                            and isinstance(f_path, str)
+                            and f_path not in state.relevant_files
+                        ):
+                            workspace_guard = (
+                                self.tool_registry.security_policy.workspace_guard
+                                if self.tool_registry and self.tool_registry.security_policy
+                                else None
+                            )
+                            is_safe = True
+                            if workspace_guard:
+                                try:
+                                    workspace_guard.validate_path(f_path)
+                                except SecurityViolationError:
+                                    is_safe = False
+                            else:
+                                if any(
+                                    re.search(pat, Path(f_path).name, re.IGNORECASE)
+                                    for pat in DEFAULT_PROTECTED_FILE_PATTERNS
+                                ):
+                                    is_safe = False
+
+                            if is_safe:
+                                state.relevant_files.append(f_path)
 
                     await self._emit_event(
                         on_event,
@@ -626,11 +685,12 @@ class AgentLoop:
         session_id: str,
     ) -> None:
         """Handle fallback notification from FallbackEngine."""
+        sanitized_err = SecretSanitizer.sanitize_text(attempt.error_message)
         logger.warning(
             "Session '%s' fallback: candidate '%s' failed: %s",
             session_id,
             attempt.candidate.target_key,
-            attempt.error_message,
+            sanitized_err,
         )
         await self._emit_event(
             on_event,
@@ -638,7 +698,7 @@ class AgentLoop:
                 "event": "model_fallback",
                 "session_id": session_id,
                 "target": attempt.candidate.target_key,
-                "error": attempt.error_message,
+                "error": sanitized_err,
                 "category": attempt.error_category.value
                 if attempt.error_category
                 else None,
@@ -708,7 +768,8 @@ class AgentLoop:
     ) -> AgentLoopResult:
         """Handle non-recoverable model failure transition."""
         state = self.state_manager.get_session(session_id)
-        error_msg = f"Model execution failed: {str(exc)}"
+        sanitized_err = SecretSanitizer.sanitize_text(str(exc))
+        error_msg = f"Model execution failed: {sanitized_err}"
         if state and not state.status.is_terminal:
             state.errors.append(error_msg)
             state = self.state_manager.transition_state(
