@@ -33,6 +33,11 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+data/
+
+# Session state & agent persistence
+.sessions/
+sessions/
 
 # IDE & Editor configs
 .idea/

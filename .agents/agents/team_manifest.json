@@ -1,0 +1,80 @@
+{
+  "project": "Lamaru AI Gateway",
+  "version": "0.1.0",
+  "framework": "Lamaru Multi-Agent Development Team",
+  "status": {
+    "completed_phases": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"],
+    "next_phase": {
+      "phase": "16",
+      "name": "Agent Loop",
+      "spec": "doc/AGENT.md",
+      "target_branch": "feat/phase-16-agent-loop"
+    },
+    "test_suite": {
+      "total": 100,
+      "passed": 99,
+      "skipped": 1,
+      "failed": 0
+    }
+  },
+  "quality_gates": [
+    "Gate 1: Test Suite Coverage & Zero Regression (Tester)",
+    "Gate 2: Security & Threat Modeling Audit (Security)",
+    "Gate 3: Code, Architecture & Red Flags Summary (Reviewer)",
+    "Gate 4: Final Verification & Handover (Lead Orchestrator)"
+  ],
+  "roles": {
+    "orchestrator": {
+      "name": "Lead Orchestrator",
+      "role": "Team Lead & Principal Architect",
+      "spec_file": ".agents/agents/orchestrator.md",
+      "capabilities": ["task_planning", "architecture_governance", "subagent_delegation", "gate_enforcement", "git_management", "human_reporting"],
+      "tools": ["read_file", "write_file", "edit_file", "run_command", "git_status", "invoke_subagent"]
+    },
+    "security": {
+      "name": "Security Agent",
+      "role": "Application Security Auditor & Threat Specialist",
+      "spec_file": ".agents/agents/security.md",
+      "capabilities": ["threat_modeling", "secret_leak_audit", "workspace_jail_verification", "command_guard_inspection", "permission_enforcement", "security_clearance"],
+      "tools": ["read_file", "git_diff", "git_log"]
+    },
+    "reviewer": {
+      "name": "Reviewer Agent",
+      "role": "Consolidated Reviewer & Quality Summary Specialist",
+      "spec_file": ".agents/agents/reviewer.md",
+      "capabilities": ["code_review_summary", "architecture_drift_detection", "red_flags_audit", "consolidated_verdict"],
+      "tools": ["read_file", "git_diff", "git_log"]
+    },
+    "tester": {
+      "name": "Tester Agent",
+      "role": "Test Automation & Reliability Engineer",
+      "spec_file": ".agents/agents/tester.md",
+      "capabilities": ["unit_testing", "integration_testing", "mock_creation", "fault_injection", "regression_verification"],
+      "tools": ["read_file", "write_file", "edit_file", "run_command"]
+    },
+    "dev1": {
+      "name": "Dev 1 - Core Engine Developer",
+      "role": "Core Subsystems & Runtime Developer",
+      "spec_file": ".agents/agents/dev1_core.md",
+      "focus_subsystems": ["src/lamaru/agent/", "src/lamaru/domain/", "src/lamaru/router/", "src/lamaru/resilience/", "src/lamaru/context/"],
+      "primary_phases": ["16", "17"],
+      "tools": ["read_file", "write_file", "edit_file", "run_command"]
+    },
+    "dev2": {
+      "name": "Dev 2 - Tools & Gateway Developer",
+      "role": "Tools, Security & Gateway Developer",
+      "spec_file": ".agents/agents/dev2_tools_gateway.md",
+      "focus_subsystems": ["src/lamaru/tools/", "src/lamaru/gateway/", "src/lamaru/mcp/"],
+      "primary_phases": ["14", "15", "20"],
+      "tools": ["read_file", "write_file", "edit_file", "run_command"]
+    },
+    "dev3": {
+      "name": "Dev 3 - Platform & Data Developer",
+      "role": "Persistence, CLI & Observability Developer",
+      "spec_file": ".agents/agents/dev3_platform_data.md",
+      "focus_subsystems": ["src/lamaru/db/", "src/lamaru/cli/", "src/lamaru/observability/", "apps/"],
+      "primary_phases": ["18", "19", "21", "22"],
+      "tools": ["read_file", "write_file", "edit_file", "run_command"]
+    }
+  }
+}
