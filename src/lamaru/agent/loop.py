@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,7 @@ from lamaru.domain.models import ModelCapability, TaskRequirement
 from lamaru.domain.tools import ToolDefinition, ToolResult
 from lamaru.providers.registry import ProviderRegistry
 from lamaru.router.fallback import FallbackAttempt, FallbackEngine, FallbackResult
+from lamaru.router.models import CandidateTarget
 from lamaru.router.router import ModelRouter
 from lamaru.tools.registry import ToolRegistry
 from lamaru.tools.security import (
@@ -388,6 +389,12 @@ class AgentLoop:
             },
         )
 
+        # Track the active model across turns to detect model switching
+        active_model: Optional[str] = (
+            state.model_history[-1] if state.model_history else None
+        )
+        emitted_switches: Set[Tuple[str, str, int]] = set()
+
         # 4. ReAct Execution Loop
         while state.iteration_count < config.max_iterations:
             if self.is_cancelled(session_id, cancellation_token):
@@ -406,27 +413,28 @@ class AgentLoop:
                 },
             )
 
-            # Assemble context
+            # Assemble base context
             relevant_files_content = self._load_relevant_files(state.relevant_files)
+            initial_limit = 32000
             assembled = self.context_manager.assemble_context(
                 task=state.task,
                 relevant_files=relevant_files_content,
                 project_knowledge=state.context_summary if state.context_summary else None,
                 messages=state.messages,
-                model_context_limit=32000,
+                model_context_limit=initial_limit,
+                output_budget=config.max_tokens or 4096,
             )
 
             tools = (
                 self.tool_registry.get_definitions() if self.tool_registry else []
             )
 
-            # Build prompt instructions
-            sys_prompt = config.system_prompt
-            if assembled.system_instruction:
-                if sys_prompt:
-                    sys_prompt = f"{sys_prompt}\n\n{assembled.system_instruction}"
-                else:
-                    sys_prompt = assembled.system_instruction
+            # Build prompt instructions with plan & progress
+            sys_prompt = self._build_system_prompt(
+                config=config,
+                state=state,
+                assembled_instruction=assembled.system_instruction,
+            )
 
             ai_request = AIRequest(
                 messages=assembled.messages,
@@ -444,6 +452,59 @@ class AgentLoop:
                 required_capabilities=config.required_capabilities or set(),
             )
 
+            # Dynamic context budgeting & request adapter callback per candidate
+            def prepare_request_for_candidate(
+                cand: CandidateTarget, req: AIRequest
+            ) -> AIRequest:
+                cand_context_limit = (
+                    cand.model.context_window
+                    if cand.model and cand.model.context_window and cand.model.context_window > 0
+                    else 32000
+                )
+                cand_output_budget = config.max_tokens or 4096
+                if cand_output_budget >= cand_context_limit:
+                    cand_output_budget = max(256, int(cand_context_limit * 0.2))
+                elif cand_context_limit - cand_output_budget < 512:
+                    cand_output_budget = max(256, int(cand_context_limit * 0.2))
+
+                cand_assembled = self.context_manager.assemble_context(
+                    task=state.task,
+                    relevant_files=relevant_files_content,
+                    project_knowledge=state.context_summary if state.context_summary else None,
+                    messages=state.messages,
+                    model_context_limit=cand_context_limit,
+                    output_budget=cand_output_budget,
+                )
+
+                cand_sys_prompt = self._build_system_prompt(
+                    config=config,
+                    state=state,
+                    assembled_instruction=cand_assembled.system_instruction,
+                )
+
+                req.messages = cand_assembled.messages
+                req.system_prompt = cand_sys_prompt
+                if config.max_tokens is None or config.max_tokens > cand_output_budget:
+                    req.max_tokens = cand_output_budget
+                return req
+
+            # Model switch callback
+            async def on_model_switch_cb(
+                from_m: str, to_m: str, switch_reason: str
+            ) -> None:
+                nonlocal active_model
+                switch_key = (from_m, to_m, state.iteration_count)
+                if switch_key not in emitted_switches:
+                    emitted_switches.add(switch_key)
+                    await self._handle_model_switch(
+                        from_model=from_m,
+                        to_model=to_m,
+                        reason=switch_reason,
+                        session_id=session_id,
+                        on_event=on_event,
+                    )
+                active_model = to_m
+
             # Call model with FallbackEngine
             try:
                 fallback_res = await self.fallback_engine.execute_with_fallback(
@@ -453,6 +514,9 @@ class AgentLoop:
                     on_fallback=lambda attempt: self._on_fallback(
                         attempt, on_event, session_id
                     ),
+                    prepare_request=prepare_request_for_candidate,
+                    on_model_switch=on_model_switch_cb,
+                    initial_model=active_model,
                 )
             except Exception as exc:
                 logger.exception(
@@ -463,7 +527,22 @@ class AgentLoop:
                 return await self._handle_model_failure(session_id, exc, on_event)
 
             cand = fallback_res.selected_candidate
+
+            # Extra safety check for model switch emission if not already emitted
+            if active_model and active_model != cand.model_id:
+                switch_key = (active_model, cand.model_id, state.iteration_count)
+                if switch_key not in emitted_switches:
+                    emitted_switches.add(switch_key)
+                    await self._handle_model_switch(
+                        from_model=active_model,
+                        to_model=cand.model_id,
+                        reason="Turn model switch",
+                        session_id=session_id,
+                        on_event=on_event,
+                    )
+
             state.model_history.append(cand.model_id)
+            active_model = cand.model_id
 
             ai_response = fallback_res.response
 
@@ -704,6 +783,67 @@ class AgentLoop:
                 else None,
             },
         )
+
+    async def _handle_model_switch(
+        self,
+        from_model: str,
+        to_model: str,
+        reason: str,
+        session_id: str,
+        on_event: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        """Emit model_switched event when transitioning between models."""
+        sanitized_reason = SecretSanitizer.sanitize_text(reason)
+        logger.info(
+            "Session '%s' model switched from '%s' to '%s': %s",
+            session_id,
+            from_model,
+            to_model,
+            sanitized_reason,
+        )
+        await self._emit_event(
+            on_event,
+            {
+                "event": "model_switched",
+                "session_id": session_id,
+                "from_model": from_model,
+                "to_model": to_model,
+                "reason": sanitized_reason,
+            },
+        )
+
+    def _build_system_prompt(
+        self,
+        config: AgentLoopConfig,
+        state: AgentState,
+        assembled_instruction: Optional[str] = None,
+    ) -> Optional[str]:
+        """Build consolidated system prompt including configuration, execution plan, and assembled instructions."""
+        parts: List[str] = []
+        if config.system_prompt:
+            parts.append(config.system_prompt)
+
+        # Include plan context if plan steps exist
+        if state.plan and state.plan.steps:
+            plan_lines = ["## Execution Plan"]
+            for idx, step in enumerate(state.plan.steps):
+                marker = "->" if idx == state.plan.current_step_index else "  "
+                status_str = (
+                    "[active]"
+                    if idx == state.plan.current_step_index
+                    else "[pending]"
+                    if idx > state.plan.current_step_index
+                    else "[done]"
+                )
+                plan_lines.append(f"{marker} Step {idx + 1}: {step} {status_str}")
+            if state.current_step:
+                plan_lines.append(f"Current Step: {state.current_step}")
+            parts.append("\n".join(plan_lines))
+
+        if assembled_instruction:
+            parts.append(assembled_instruction)
+
+        return "\n\n".join(parts) if parts else None
 
     async def _handle_cancellation(
         self,

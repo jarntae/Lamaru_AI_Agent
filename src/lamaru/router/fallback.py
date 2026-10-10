@@ -84,6 +84,9 @@ class FallbackEngine:
         max_fallbacks: int = 5,
         on_fallback: Optional[Callable[[FallbackAttempt], Any]] = None,
         now: Optional[datetime] = None,
+        prepare_request: Optional[Callable[[CandidateTarget, AIRequest], Any]] = None,
+        on_model_switch: Optional[Callable[[str, str, str], Any]] = None,
+        initial_model: Optional[str] = None,
     ) -> FallbackResult:
         """Execute request across fallback candidates until success or all candidates exhausted."""
         current_time = now or datetime.now(timezone.utc)
@@ -96,6 +99,7 @@ class FallbackEngine:
 
         attempted_keys: Set[str] = set()
         attempts_history: List[FallbackAttempt] = []
+        active_model: Optional[str] = initial_model
 
         for attempt_idx in range(1, max_fallbacks + 1):
             # 1. Ask router for best available candidate excluding already attempted ones
@@ -117,6 +121,19 @@ class FallbackEngine:
             cand = route_res.selected_candidate
             attempted_keys.add(cand.target_key)
 
+            # Check if candidate model switched from active_model
+            if active_model and active_model != cand.model_id:
+                reason = (
+                    attempts_history[-1].error_message
+                    if attempts_history and not attempts_history[-1].success
+                    else "Candidate router selection"
+                )
+                if on_model_switch:
+                    switch_res = on_model_switch(active_model, cand.model_id, reason)
+                    if hasattr(switch_res, "__await__"):
+                        await switch_res
+            active_model = cand.model_id
+
             # 2. Retrieve provider adapter
             provider = self.provider_registry.get(cand.provider)
             if not provider or not provider.is_enabled:
@@ -135,6 +152,14 @@ class FallbackEngine:
             target_req.model = cand.model_id
             target_req.provider = cand.provider
             target_req.key_id = cand.key_id
+
+            # Dynamic context budgeting or request adaptation per candidate
+            if prepare_request is not None:
+                prep_res = prepare_request(cand, target_req)
+                if hasattr(prep_res, "__await__"):
+                    target_req = await prep_res
+                elif prep_res is not None:
+                    target_req = prep_res
 
             logger.info(
                 f"Fallback attempt {attempt_idx}/{max_fallbacks} -> {cand.target_key}"
